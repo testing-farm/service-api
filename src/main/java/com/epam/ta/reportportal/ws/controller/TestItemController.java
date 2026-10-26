@@ -207,7 +207,7 @@ public class TestItemController {
     return TestItemConverter.TO_RESOURCE_TIMESTAMP.apply(testItem);
   }
 
-  @Transactional(readOnly = true)
+  // No transaction here: SuggestItemService keeps the analyzer RPC outside its transactions
   @GetMapping("/suggest/{itemId}")
   @ResponseStatus(OK)
   @Operation(summary = "Search suggested items in analyzer for provided one")

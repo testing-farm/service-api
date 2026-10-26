@@ -2,6 +2,7 @@ package com.epam.ta.reportportal.ws.controller;
 
 import com.epam.reportportal.rules.exception.ErrorRS;
 import com.epam.reportportal.rules.exception.ReportPortalException;
+import com.epam.ta.reportportal.exception.AnalyzerBusyException;
 import com.epam.ta.reportportal.exception.ExceptionMappings;
 import com.epam.ta.reportportal.exception.forwarding.ClientResponseForwardingExceptionHandler;
 import com.epam.ta.reportportal.exception.forwarding.ResponseForwardingException;
@@ -75,6 +76,12 @@ public class ErrorHandlingController {
   @ExceptionHandler({BadCredentialsException.class, LockedException.class})
   @ResponseStatus(HttpStatus.UNAUTHORIZED)
   public ErrorRS handle(BadCredentialsException exception) {
+    return defaultErrorResolver.resolveError(exception).errorRs();
+  }
+
+  @ExceptionHandler(AnalyzerBusyException.class)
+  @ResponseStatus(HttpStatus.SERVICE_UNAVAILABLE)
+  public ErrorRS handle(AnalyzerBusyException exception) {
     return defaultErrorResolver.resolveError(exception).errorRs();
   }
 

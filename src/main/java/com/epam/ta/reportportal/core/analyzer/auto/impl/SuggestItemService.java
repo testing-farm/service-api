@@ -41,6 +41,7 @@ import com.epam.ta.reportportal.entity.item.issue.IssueEntity;
 import com.epam.ta.reportportal.entity.launch.Launch;
 import com.epam.ta.reportportal.entity.project.Project;
 import com.epam.ta.reportportal.entity.user.UserRole;
+import com.epam.ta.reportportal.exception.AnalyzerBusyException;
 import com.epam.ta.reportportal.ws.converter.converters.IssueConverter;
 import com.epam.ta.reportportal.ws.converter.converters.LogConverter;
 import com.epam.ta.reportportal.ws.converter.converters.TestItemConverter;
@@ -49,16 +50,24 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.Semaphore;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
-import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
+ * Requests suggestions from the analyzer.
+ *
+ * <p>The analyzer call is a blocking RPC that can take minutes. The service reads the data for the
+ * request in one read-only transaction, calls the analyzer outside any transaction, and maps the
+ * reply in a second read-only transaction, so no database connection is held while it waits.
+ *
  * @author <a href="mailto:pavel_bortnik@epam.com">Pavel Bortnik</a>
  */
 @Service
-@RequiredArgsConstructor
 public class SuggestItemService {
 
   private static final int SUGGESTED_ITEMS_LOGS_LIMIT = 5;
@@ -77,22 +86,64 @@ public class SuggestItemService {
 
   private final List<TestItemValidator> testItemValidators;
 
+  private final TransactionTemplate readOnlyTransaction;
 
-  @Transactional(readOnly = true)
+  /**
+   * Limits concurrent suggest requests, {@code null} when there is no limit.
+   */
+  private final Semaphore suggestPermits;
+
+  public SuggestItemService(AnalyzerServiceClient analyzerServiceClient,
+      GetProjectHandler getProjectHandler, GetLaunchHandler getLaunchHandler,
+      GetClusterHandler getClusterHandler, LaunchAccessValidator launchAccessValidator,
+      TestItemRepository testItemRepository, LogService logService, LogConverter logConverter,
+      List<TestItemValidator> testItemValidators, PlatformTransactionManager transactionManager,
+      @Value("${rp.analyzer.suggest.max-concurrent:0}") int maxConcurrentSuggests) {
+    this.analyzerServiceClient = analyzerServiceClient;
+    this.getProjectHandler = getProjectHandler;
+    this.getLaunchHandler = getLaunchHandler;
+    this.getClusterHandler = getClusterHandler;
+    this.launchAccessValidator = launchAccessValidator;
+    this.testItemRepository = testItemRepository;
+    this.logService = logService;
+    this.logConverter = logConverter;
+    this.testItemValidators = testItemValidators;
+    this.readOnlyTransaction = new TransactionTemplate(transactionManager);
+    this.readOnlyTransaction.setReadOnly(true);
+    this.suggestPermits = maxConcurrentSuggests > 0 ? new Semaphore(maxConcurrentSuggests) : null;
+  }
+
   public List<SuggestedItem> suggestItems(Long testItemId,
       ReportPortalUser.ProjectDetails projectDetails, ReportPortalUser user) {
+    return withSuggestPermit(() -> {
+      SuggestRq suggestRq = readOnlyTransaction.execute(status -> {
+        TestItem testItem = testItemRepository.findById(testItemId)
+            .orElseThrow(() -> new ReportPortalException(ErrorType.TEST_ITEM_NOT_FOUND, testItemId));
 
-    TestItem testItem = testItemRepository.findById(testItemId)
-        .orElseThrow(() -> new ReportPortalException(ErrorType.TEST_ITEM_NOT_FOUND, testItemId));
+        validateTestItem(testItem);
 
-    validateTestItem(testItem);
+        Launch launch = getLaunch(testItem.getLaunchId(), projectDetails, user);
+        isItemUnderProject(projectDetails, user, launch);
+        Project project = getProjectHandler.get(projectDetails);
 
-    Launch launch = getLaunch(testItem.getLaunchId(), projectDetails, user);
-    isItemUnderProject(projectDetails, user, launch);
-    Project project = getProjectHandler.get(projectDetails);
+        return prepareSuggestRq(testItem, launch, project);
+      });
+      return getSuggestedItems(suggestRq);
+    });
+  }
 
-    SuggestRq suggestRq = prepareSuggestRq(testItem, launch, project);
-    return getSuggestedItems(suggestRq);
+  private List<SuggestedItem> withSuggestPermit(Supplier<List<SuggestedItem>> suggest) {
+    if (suggestPermits == null) {
+      return suggest.get();
+    }
+    if (!suggestPermits.tryAcquire()) {
+      throw new AnalyzerBusyException("Too many concurrent suggest requests, try again later.");
+    }
+    try {
+      return suggest.get();
+    } finally {
+      suggestPermits.release();
+    }
   }
 
   private void validateTestItem(TestItem testItem) {
@@ -112,14 +163,17 @@ public class SuggestItemService {
     }
   }
 
-  @Transactional(readOnly = true)
   public List<SuggestedItem> suggestClusterItems(Long clusterId,
       ReportPortalUser.ProjectDetails projectDetails, ReportPortalUser user) {
-    final Cluster cluster = getClusterHandler.getById(clusterId);
-    final Launch launch = getLaunch(cluster.getLaunchId(), projectDetails, user);
-    final Project project = getProjectHandler.get(projectDetails);
-    final SuggestRq suggestRq = prepareSuggestRq(cluster, launch, project);
-    return getSuggestedItems(suggestRq);
+    return withSuggestPermit(() -> {
+      final SuggestRq suggestRq = readOnlyTransaction.execute(status -> {
+        final Cluster cluster = getClusterHandler.getById(clusterId);
+        final Launch launch = getLaunch(cluster.getLaunchId(), projectDetails, user);
+        final Project project = getProjectHandler.get(projectDetails);
+        return prepareSuggestRq(cluster, launch, project);
+      });
+      return getSuggestedItems(suggestRq);
+    });
   }
 
   private Launch getLaunch(Long launchId, ReportPortalUser.ProjectDetails projectDetails,
@@ -159,11 +213,13 @@ public class SuggestItemService {
   }
 
   private List<SuggestedItem> getSuggestedItems(SuggestRq suggestRq) {
-    return analyzerServiceClient.searchSuggests(suggestRq)
+    // Blocking RPC to the analyzer, runs outside any transaction
+    List<SuggestInfo> suggestInfos = analyzerServiceClient.searchSuggests(suggestRq);
+    return readOnlyTransaction.execute(status -> suggestInfos
         .stream()
         .map(this::prepareSuggestedItem)
         .filter(Objects::nonNull)
-        .collect(Collectors.toList());
+        .collect(Collectors.toList()));
   }
 
   private SuggestedItem prepareSuggestedItem(SuggestInfo suggestInfo) {
