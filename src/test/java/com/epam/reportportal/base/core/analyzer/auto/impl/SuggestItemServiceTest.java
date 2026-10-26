@@ -4,6 +4,7 @@ import static com.epam.reportportal.base.ReportPortalUserUtil.getRpUser;
 import static com.epam.reportportal.base.infrastructure.persistence.entity.enums.LogLevel.ERROR_INT;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.anyList;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -18,6 +19,7 @@ import com.epam.reportportal.base.core.launch.GetLaunchHandler;
 import com.epam.reportportal.base.core.launch.cluster.GetClusterHandler;
 import com.epam.reportportal.base.core.log.LogService;
 import com.epam.reportportal.base.core.project.GetProjectHandler;
+import com.epam.reportportal.base.exception.AnalyzerBusyException;
 import com.epam.reportportal.base.infrastructure.persistence.commons.ReportPortalUser;
 import com.epam.reportportal.base.infrastructure.persistence.dao.TestItemRepository;
 import com.epam.reportportal.base.infrastructure.persistence.entity.cluster.Cluster;
@@ -38,8 +40,17 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.TransactionStatus;
+import org.springframework.transaction.support.SimpleTransactionStatus;
 
 class SuggestItemServiceTest {
 
@@ -58,17 +69,52 @@ class SuggestItemServiceTest {
   private final LogConverter logConverter = mock(LogConverter.class);
   private final List<TestItemValidator> validators = List.of(testItemValidator);
 
-  private final SuggestItemService suggestItemService = new SuggestItemService(
-      analyzerServiceClient,
-      getProjectHandler,
-      getLaunchHandler,
-      getClusterHandler,
-      launchAccessValidator,
-      testItemRepository,
-      logService,
-      logConverter,
-      validators
-  );
+  private final TrackingTransactionManager transactionManager = new TrackingTransactionManager();
+
+  private final SuggestItemService suggestItemService = createService(0);
+
+  private SuggestItemService createService(int maxConcurrentSuggests) {
+    return new SuggestItemService(
+        analyzerServiceClient,
+        getProjectHandler,
+        getLaunchHandler,
+        getClusterHandler,
+        launchAccessValidator,
+        testItemRepository,
+        logService,
+        logConverter,
+        validators,
+        transactionManager,
+        maxConcurrentSuggests
+    );
+  }
+
+  /**
+   * Records whether a transaction is active and how many were started.
+   */
+  private static class TrackingTransactionManager implements PlatformTransactionManager {
+
+    private final AtomicBoolean active = new AtomicBoolean();
+    private final AtomicInteger started = new AtomicInteger();
+
+    @Override
+    public TransactionStatus getTransaction(TransactionDefinition definition) {
+      Assertions.assertTrue(definition.isReadOnly(), "Suggest transactions should be read-only");
+      active.set(true);
+      started.incrementAndGet();
+      return new SimpleTransactionStatus();
+    }
+
+    @Override
+    public void commit(TransactionStatus status) {
+      active.set(false);
+    }
+
+    @Override
+    public void rollback(TransactionStatus status) {
+      active.set(false);
+    }
+  }
 
   @Test
   void suggestItems() {
@@ -262,5 +308,93 @@ class SuggestItemServiceTest {
     relevantItem.setItemResults(relevantItemRes);
 
     return relevantItem;
+  }
+
+  private void mockSuggestData(Long launchId) {
+    final Project project = new Project();
+    project.setId(1L);
+    project.setKey("default");
+    TestItem testItem = new TestItem();
+    testItem.setItemId(1L);
+    testItem.setLaunchId(launchId);
+
+    Launch launch = new Launch();
+    launch.setId(launchId);
+    launch.setProjectId(1L);
+
+    SuggestInfo suggestInfo = new SuggestInfo();
+    suggestInfo.setRelevantItem(2L);
+
+    when(testItemRepository.findById(1L)).thenReturn(Optional.of(testItem));
+    when(testItemValidator.validate(any(TestItem.class))).thenReturn(true);
+    when(testItemRepository.findById(2L)).thenReturn(Optional.of(getRelevantItem()));
+    when(getLaunchHandler.get(launchId)).thenReturn(launch);
+    when(getProjectHandler.get(any(MembershipDetails.class))).thenReturn(project);
+    when(analyzerServiceClient.searchSuggests(any(SuggestRq.class))).thenReturn(
+        Collections.singletonList(suggestInfo));
+  }
+
+  private List<SuggestedItem> suggest(SuggestItemService service) {
+    return service.suggestItems(1L,
+        MembershipDetails.builder()
+            .withProjectId(1L)
+            .withProjectRole(ProjectRole.VIEWER)
+            .build(),
+        getRpUser("owner", UserRole.USER, OrganizationRole.MEMBER, ProjectRole.VIEWER, 1L)
+    );
+  }
+
+  @Test
+  void suggestCallsAnalyzerOutsideTransaction() {
+    mockSuggestData(1L);
+    AtomicBoolean activeDuringRpc = new AtomicBoolean(true);
+    doAnswer(invocation -> {
+      activeDuringRpc.set(transactionManager.active.get());
+      SuggestInfo suggestInfo = new SuggestInfo();
+      suggestInfo.setRelevantItem(2L);
+      return Collections.singletonList(suggestInfo);
+    }).when(analyzerServiceClient).searchSuggests(any(SuggestRq.class));
+
+    final List<SuggestedItem> suggestedItems = suggest(suggestItemService);
+
+    Assertions.assertEquals(1, suggestedItems.size());
+    Assertions.assertFalse(activeDuringRpc.get(), "The analyzer RPC should run without a transaction");
+    Assertions.assertEquals(2, transactionManager.started.get());
+    Assertions.assertFalse(transactionManager.active.get());
+  }
+
+  @Test
+  void suggestRejectsRequestsPastLimit() throws Exception {
+    mockSuggestData(1L);
+    final SuggestItemService limitedService = createService(1);
+    CountDownLatch rpcStarted = new CountDownLatch(1);
+    CountDownLatch releaseRpc = new CountDownLatch(1);
+    doAnswer(invocation -> {
+      rpcStarted.countDown();
+      Assertions.assertTrue(releaseRpc.await(10, TimeUnit.SECONDS));
+      return Collections.emptyList();
+    }).when(analyzerServiceClient).searchSuggests(any(SuggestRq.class));
+
+    CompletableFuture<List<SuggestedItem>> first = CompletableFuture.supplyAsync(
+        () -> suggest(limitedService));
+    Assertions.assertTrue(rpcStarted.await(10, TimeUnit.SECONDS));
+
+    Assertions.assertThrows(AnalyzerBusyException.class, () -> suggest(limitedService));
+
+    releaseRpc.countDown();
+    Assertions.assertTrue(first.get(10, TimeUnit.SECONDS).isEmpty());
+
+    // The permit is released after the first request finishes
+    Assertions.assertTrue(suggest(limitedService).isEmpty());
+  }
+
+  @Test
+  void suggestReleasesPermitOnError() {
+    final SuggestItemService limitedService = createService(1);
+    when(testItemRepository.findById(1L)).thenReturn(Optional.empty());
+
+    Assertions.assertThrows(ReportPortalException.class, () -> suggest(limitedService));
+    Assertions.assertThrows(ReportPortalException.class, () -> suggest(limitedService));
+    Assertions.assertFalse(transactionManager.active.get());
   }
 }

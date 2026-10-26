@@ -78,6 +78,8 @@ public final class ExceptionMappings {
           new RestErrorDefinition<>(400, ErrorType.INCORRECT_REQUEST, DEFAULT_MESSAGE_BUILDER))
       .put(MissingPathVariableException.class,
           new RestErrorDefinition<>(400, ErrorType.INCORRECT_REQUEST, DEFAULT_MESSAGE_BUILDER))
+      .put(AnalyzerBusyException.class,
+          new RestErrorDefinition<>(503, ErrorType.UNABLE_INTERACT_WITH_INTEGRATION, DEFAULT_MESSAGE_BUILDER))
       .put(Throwable.class, new RestErrorDefinition<>(500, ErrorType.UNCLASSIFIED_ERROR, DEFAULT_MESSAGE_BUILDER))
       .build();
 }

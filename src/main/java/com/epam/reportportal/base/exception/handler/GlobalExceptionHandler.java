@@ -16,6 +16,7 @@
 
 package com.epam.reportportal.base.exception.handler;
 
+import com.epam.reportportal.base.exception.AnalyzerBusyException;
 import com.epam.reportportal.base.exception.ExceptionMappings;
 import com.epam.reportportal.base.exception.forwarding.ClientResponseForwardingExceptionHandler;
 import com.epam.reportportal.base.exception.forwarding.ResponseForwardingException;
@@ -99,6 +100,12 @@ public class GlobalExceptionHandler {
   @ExceptionHandler({BadCredentialsException.class, LockedException.class})
   @ResponseStatus(HttpStatus.UNAUTHORIZED)
   public ErrorRS handle(BadCredentialsException exception) {
+    return defaultErrorResolver.resolveError(exception).errorRs();
+  }
+
+  @ExceptionHandler(AnalyzerBusyException.class)
+  @ResponseStatus(HttpStatus.SERVICE_UNAVAILABLE)
+  public ErrorRS handle(AnalyzerBusyException exception) {
     return defaultErrorResolver.resolveError(exception).errorRs();
   }
 
